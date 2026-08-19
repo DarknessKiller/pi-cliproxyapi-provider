@@ -1,16 +1,16 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
 	AUTH_FILE_NAME,
+	applyContextCap,
 	buildInputModalities,
 	buildThinkingLevelMap,
 	CONFIG_FILE_NAME,
 	type CodexClientModel,
 	DEFAULT_BASE_URL,
 	DEFAULT_CONTEXT_WINDOW,
-	DEFAULT_MAX_TOKENS,
 	DEFAULT_PROVIDER_ID,
 	DEFAULT_PROVIDER_NAME,
 	decodeRefreshMeta,
@@ -24,6 +24,7 @@ import {
 	ModelsHttpError,
 	matchModelCost,
 	parseBooleanSetting,
+	resolveContextCapReserveTokens,
 	resolveEndpoints,
 	resolveFastDefault,
 	resolveIdentity,
@@ -34,6 +35,16 @@ import {
 } from "../extensions/lib.ts";
 
 const tempDirs: string[] = [];
+const isolatedAgentDir = mkdtempSync(join(tmpdir(), "pi-cliproxyapi-lib-test-agent-"));
+
+beforeAll(() => {
+	vi.stubEnv("PI_AGENT_DIR", isolatedAgentDir);
+});
+
+afterAll(() => {
+	vi.unstubAllEnvs();
+	rmSync(isolatedAgentDir, { recursive: true, force: true });
+});
 
 afterEach(() => {
 	while (tempDirs.length > 0) {
@@ -152,11 +163,28 @@ describe("model mapping helpers", () => {
 		expect(supportsFastServiceTier({ service_tiers: {} } as unknown as CodexClientModel)).toBe(false);
 	});
 
-	it("maps codex catalog entries to pi models", () => {
+	it("uses an explicit maxTokens setting for both output and reserve", () => {
+		expect(
+			applyContextCap("gpt-5.6-luna", 272_000, 128_000, {
+				cap: 304_768,
+				appliesOver: 220_000,
+				maxTokens: 32_768,
+				matchPatterns: ["*"],
+			}),
+		).toEqual({ contextWindow: 304_768, maxTokens: 32_768 });
+	});
+
+	it("reads an explicit context-cap reserve", () => {
+		expect(resolveContextCapReserveTokens({ reserveTokens: 16_384 })).toBe(16_384);
+		expect(resolveContextCapReserveTokens({ reserveTokens: -1 })).toBeUndefined();
+	});
+
+	it("maps the catalog output limit to pi maxTokens", () => {
 		const model = toPiModel({
 			slug: "gpt-5",
 			display_name: "GPT-5",
 			context_window: 200000,
+			max_completion_tokens: 128000,
 			input_modalities: ["text", "image"],
 			supported_reasoning_levels: [{ effort: "high" }, { effort: "none" }],
 		});
@@ -168,7 +196,7 @@ describe("model mapping helpers", () => {
 			input: ["text", "image"],
 			cost: { ...ZERO_COST },
 			contextWindow: 200000,
-			maxTokens: DEFAULT_MAX_TOKENS,
+			maxTokens: 128000,
 			thinkingLevelMap: buildThinkingLevelMap(["high", "none"]),
 		});
 	});

@@ -203,6 +203,7 @@ From CPA catalog entry → pi model:
 | `slug` | `id` |
 | `display_name` | `name` |
 | `context_window` | `contextWindow` |
+| `max_completion_tokens` | `maxTokens` |
 | `input_modalities` | `input` (`text` / `image`) |
 | `supported_reasoning_levels[].effort` | `thinkingLevelMap` + `reasoning` |
 | `visibility: "hide"` | skipped |
@@ -210,6 +211,29 @@ From CPA catalog entry → pi model:
 Unsupported pi thinking levels are set to `null` so they are hidden in the UI. When available, prices are matched against canonical model entries in `models.dev`; `cost.tiers[].tier.size` becomes pi's `inputTokensAbove`, including thresholds such as `272000`. The legacy `context_over_200k` field is used only when no explicit tiers are present. Ambiguous reseller prices are not selected arbitrarily and fall back to zero. These are catalog/list prices, not a guarantee of CPA's own markup or billing.
 
 The raw `models.dev` response is cached for 24 hours at `~/.pi/agent/tmp/models-dev-cache.json`. A fresh cache avoids the network request; an expired cache is refreshed with a three-second timeout, and stale data is retained if refresh fails. If neither the network nor a previous cache is available, pricing safely falls back to zero. A small explicit alias table covers known CLIProxyAPI variants such as `gemini-pro-agent` → `gemini-3.1-pro-preview`; unknown variants are not guessed.
+
+### Context and output limits
+
+The provider reads the shared `~/.pi/agent/extensions/context-cap.json` file used by `pi-context-cap`:
+
+```json
+{
+  "cap": 304768,
+  "appliesOver": 240000,
+  "maxTokens": 32768,
+  "reserveTokens": 32768,
+  "matchPatterns": ["*"]
+}
+```
+
+- `cap` sets the total reported `contextWindow` for matching models above `appliesOver`; with `cap: 304768` and `maxTokens: 32768`, usable input is `272000` tokens, even if the catalog reports a smaller stale window.
+- `maxTokens` is an explicit output-token limit. It overrides the catalog value only when configured; otherwise `max_completion_tokens` from CPA is used, falling back to `16384`.
+- `reserveTokens` optionally overrides `settings.json`'s compaction reserve for this provider. It is still raised to `maxTokens` when needed.
+- If `reserveTokens` is omitted, the larger of `settings.json`'s reserve and the model's `maxTokens` is used.
+- `matchPatterns` must match the model id for global settings to apply.
+- Per-model entries can set `contextWindow` and/or `maxTokens`; both are exact per-model overrides.
+
+Cached models preserve their catalog output limits and are updated with these settings on startup; use `/cliproxyapi-refresh` after changing the file while pi is running.
 
 ## Migration from static models.json
 

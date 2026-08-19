@@ -1,12 +1,27 @@
 import { type Api, type AssistantMessage, createAssistantMessageEventStream, type Model } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, SettingsManager } from "@earendil-works/pi-coding-agent";
 import type { CliproxyCodexStreamSimple } from "./codex-stream.ts";
+import { resolveContextCapReserveTokens } from "./lib.ts";
 
 export const PROACTIVE_COMPACTION_ERROR_PREFIX = "context_length_exceeded: proactive compaction threshold reached";
 
 export interface ProactiveCompactionSettings {
 	enabled: boolean;
 	reserveTokens: number;
+}
+
+/** Keep enough headroom for the model's output budget and optional reserve override. */
+export function resolveCompactionReserveTokens(
+	reserveTokens: number,
+	maxTokens?: number,
+	reserveOverride?: number,
+): number {
+	const effectiveReserve =
+		typeof reserveOverride === "number" && Number.isFinite(reserveOverride) && reserveOverride >= 0
+			? reserveOverride
+			: reserveTokens;
+	if (typeof maxTokens !== "number" || !Number.isFinite(maxTokens) || maxTokens <= 0) return effectiveReserve;
+	return Math.max(effectiveReserve, Math.ceil(maxTokens));
 }
 
 export function shouldScheduleProactiveCompaction(
@@ -108,7 +123,8 @@ export class ProactiveCompactionController {
 				return;
 			}
 			await settingsManager.reload();
-			const settings = settingsManager.getCompactionSettings();
+			const settings = this.getCompactionSettings(ctx.model.maxTokens);
+			if (!settings) return;
 			const contextTokens = ctx.getContextUsage()?.tokens;
 			if (contextTokens === null || contextTokens === undefined) {
 				return;
@@ -125,8 +141,17 @@ export class ProactiveCompactionController {
 		});
 	}
 
-	getCompactionSettings(): ProactiveCompactionSettings | undefined {
-		return this.settingsManager?.getCompactionSettings();
+	getCompactionSettings(maxTokens?: number): ProactiveCompactionSettings | undefined {
+		const settings = this.settingsManager?.getCompactionSettings();
+		if (!settings) return undefined;
+		return {
+			...settings,
+			reserveTokens: resolveCompactionReserveTokens(
+				settings.reserveTokens,
+				maxTokens,
+				resolveContextCapReserveTokens(),
+			),
+		};
 	}
 
 	wrapStreamSimple(streamSimple: CliproxyCodexStreamSimple): CliproxyCodexStreamSimple {

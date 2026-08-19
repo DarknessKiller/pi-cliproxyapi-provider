@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
 	PROACTIVE_COMPACTION_ERROR_PREFIX,
 	ProactiveCompactionController,
+	resolveCompactionReserveTokens,
 	shouldScheduleProactiveCompaction,
 } from "../extensions/auto-compact.ts";
 import type { CliproxyCodexStreamSimple } from "../extensions/codex-stream.ts";
@@ -40,6 +41,28 @@ function assistantMessage(
 		timestamp: Date.now(),
 	};
 }
+
+describe("proactive compaction reserve", () => {
+	it("matches the reserve to the model output limit", () => {
+		expect(resolveCompactionReserveTokens(16_384, 32_768)).toBe(32_768);
+	});
+
+	it("allows an explicit context-cap reserve override", () => {
+		expect(resolveCompactionReserveTokens(32_768, 16_384, 16_384)).toBe(16_384);
+	});
+
+	it("never reserves less than the output limit", () => {
+		expect(resolveCompactionReserveTokens(32_768, 32_768, 16_384)).toBe(32_768);
+	});
+
+	it("keeps an explicitly larger reserve", () => {
+		expect(resolveCompactionReserveTokens(65_536, 32_768)).toBe(65_536);
+	});
+
+	it("keeps the configured reserve when output is unavailable", () => {
+		expect(resolveCompactionReserveTokens(16_384)).toBe(16_384);
+	});
+});
 
 describe("proactive compaction threshold", () => {
 	it("schedules an over-threshold tool turn", () => {

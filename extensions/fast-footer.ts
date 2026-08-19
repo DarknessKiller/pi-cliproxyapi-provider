@@ -15,6 +15,7 @@ interface MutableModel {
 	provider: string;
 	reasoning: boolean;
 	contextWindow: number;
+	maxTokens?: number;
 }
 
 interface FooterSessionLike {
@@ -109,6 +110,7 @@ function installFooterPatch(controller: FastFooterController): void {
 				model.contextWindow = activeController.getDisplayContextWindow(
 					originalContextWindow,
 					footer.autoCompactEnabled ?? false,
+					model.maxTokens,
 				);
 				try {
 					return originalRender.call(this, width);
@@ -146,7 +148,9 @@ export class FastFooterController {
 	constructor(
 		private readonly providerId: string,
 		private readonly fastMode: FastModeController,
-		private readonly resolveCompactionSettings: () => ProactiveCompactionSettings | undefined = () => undefined,
+		private readonly resolveCompactionSettings: (
+			maxTokens?: number,
+		) => ProactiveCompactionSettings | undefined = () => undefined,
 		private readonly pauseMode: PauseController = pauseController,
 	) {}
 
@@ -193,8 +197,8 @@ export class FastFooterController {
 		return this.pauseMode.isEnabled();
 	}
 
-	getDisplayContextWindow(contextWindow: number, autoCompactEnabled: boolean): number {
-		const settings = this.resolveCompactionSettings();
+	getDisplayContextWindow(contextWindow: number, autoCompactEnabled: boolean, maxTokens?: number): number {
+		const settings = this.resolveCompactionSettings(maxTokens);
 		if (!autoCompactEnabled || !settings || !Number.isFinite(settings.reserveTokens) || settings.reserveTokens < 0) {
 			return contextWindow;
 		}

@@ -633,8 +633,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		return;
 	}
 
-	const fastFooter = new FastFooterController(identity.providerId, fastMode, () =>
-		proactiveCompaction.getCompactionSettings(),
+	const fastFooter = new FastFooterController(identity.providerId, fastMode, (maxTokens) =>
+		proactiveCompaction.getCompactionSettings(maxTokens),
 	);
 	let refreshModelsForFast: ((ctx: ExtensionContext) => Promise<void>) | undefined;
 	const onFastModeChange = async (_enabled: boolean, ctx: ExtensionContext): Promise<void> => {

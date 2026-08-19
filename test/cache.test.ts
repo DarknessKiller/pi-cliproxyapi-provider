@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import providerExtension from "../extensions/index.ts";
 import {
 	CONFIG_FILE_NAME,
@@ -25,9 +25,10 @@ const CLIPROXYAPI_ENV_NAMES = [
 	"CLIPROXYAPI_FAST",
 	"CLIPROXYAPI_PROVIDER_ID",
 	"CLIPROXYAPI_PROVIDER_NAME",
+	"PI_AGENT_DIR",
 ] as const;
 
-function createModel(id: string): PiProviderModel {
+function createModel(id: string, maxTokens = 16384): PiProviderModel {
 	return {
 		id,
 		name: id,
@@ -35,7 +36,7 @@ function createModel(id: string): PiProviderModel {
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 128000,
-		maxTokens: 16384,
+		maxTokens,
 	};
 }
 
@@ -62,6 +63,16 @@ function createMappedModels(
 }
 
 const tempPaths: string[] = [];
+const isolatedAgentDir = mkdtempSync(join(tmpdir(), "pi-cliproxyapi-cache-test-agent-"));
+
+beforeAll(() => {
+	vi.stubEnv("PI_AGENT_DIR", isolatedAgentDir);
+});
+
+afterAll(() => {
+	vi.unstubAllEnvs();
+	rmSync(isolatedAgentDir, { recursive: true, force: true });
+});
 
 function tempAgentDir(): string {
 	const dir = mkdtempSync(join(tmpdir(), "pi-cliproxyapi-cache-test-"));
@@ -219,7 +230,7 @@ describe("models request timeout wiring", () => {
 describe("resolveMappedModels cache behavior", () => {
 	it("returns an existing cache without fetching regardless of age", async () => {
 		const agentDir = tempAgentDir();
-		const cached = createMappedModels({ models: [createModel("cached")], fastModelIds: ["fast-cached"] });
+		const cached = createMappedModels({ models: [createModel("cached", 128_000)], fastModelIds: ["fast-cached"] });
 		saveModelsCache(agentDir, cached, 1);
 
 		const fetchMock = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("should not fetch"));

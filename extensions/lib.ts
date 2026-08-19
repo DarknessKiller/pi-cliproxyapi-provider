@@ -29,6 +29,86 @@ export const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as
 export const DEFAULT_MAX_TOKENS = 16384;
 export const DEFAULT_CONTEXT_WINDOW = 128000;
 
+// --- Context-cap support ---
+// Reads from ~/.pi/agent/extensions/context-cap.json (shared with pi-context-cap extension).
+
+export interface ContextCapConfig {
+	cap?: number;
+	maxTokens?: number;
+	reserveTokens?: number;
+	appliesOver?: number;
+	matchPatterns?: string[];
+	models?: Record<string, number | { contextWindow?: number; maxTokens?: number }>;
+}
+
+let _capConfig: ContextCapConfig | null = null;
+let _capConfigLoaded = false;
+
+function loadCapConfig(): ContextCapConfig {
+	if (_capConfigLoaded) return _capConfig ?? {};
+	_capConfigLoaded = true;
+	try {
+		const agentDir = process.env.PI_AGENT_DIR || join(process.env.HOME || "", ".pi", "agent");
+		const capPath = join(agentDir, "extensions", "context-cap.json");
+		const raw = readFileSync(capPath, "utf-8");
+		_capConfig = JSON.parse(raw) as ContextCapConfig;
+	} catch {
+		_capConfig = {};
+	}
+	return _capConfig ?? {};
+}
+
+function reloadCapConfig(): void {
+	_capConfig = null;
+	_capConfigLoaded = false;
+}
+
+export function resolveContextCapReserveTokens(cfg = loadCapConfig()): number | undefined {
+	const reserveTokens = cfg.reserveTokens;
+	return typeof reserveTokens === "number" && Number.isFinite(reserveTokens) && reserveTokens >= 0
+		? reserveTokens
+		: undefined;
+}
+
+function matchesPatterns(modelId: string, patterns: string[]): boolean {
+	if (patterns.length === 0) return false;
+	const id = modelId.toLowerCase();
+	return patterns.some((p) => p === "*" || id.includes(p.toLowerCase()));
+}
+
+/** Apply context-cap config to a model's contextWindow and explicit output limit. */
+export function applyContextCap(
+	id: string,
+	contextWindow: number,
+	maxTokens: number,
+	cfg = loadCapConfig(),
+): { contextWindow: number; maxTokens: number } {
+	let cw = contextWindow;
+	let mt = maxTokens;
+
+	// Per-model override wins. contextWindow is a cap; maxTokens is exact.
+	const perModel = cfg.models?.[id];
+	if (perModel != null) {
+		if (typeof perModel === "number") {
+			if (cw > perModel) cw = perModel;
+		} else {
+			if (perModel.contextWindow != null && cw > perModel.contextWindow) cw = perModel.contextWindow;
+			if (perModel.maxTokens != null && perModel.maxTokens > 0) mt = perModel.maxTokens;
+		}
+		return { contextWindow: cw, maxTokens: mt };
+	}
+
+	const patterns = cfg.matchPatterns ?? [];
+	if (!matchesPatterns(id, patterns)) return { contextWindow: cw, maxTokens: mt };
+
+	const appliesOver = cfg.appliesOver ?? 200_000;
+	const cap = cfg.cap ?? 200_000;
+	if (cw > appliesOver && cap > 0) cw = cap;
+
+	if (cfg.maxTokens != null && cfg.maxTokens > 0) mt = cfg.maxTokens;
+	return { contextWindow: cw, maxTokens: mt };
+}
+
 const PI_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 
 export interface CliproxyConfigFile {
@@ -71,6 +151,7 @@ export interface CodexClientModel {
 	description?: string;
 	context_window?: number;
 	max_context_window?: number;
+	max_completion_tokens?: number;
 	input_modalities?: string[];
 	supported_reasoning_levels?: CodexReasoningLevel[] | string[];
 	default_service_tier?: string | null;
@@ -487,14 +568,19 @@ export function toPiModel(
 		? matchModelCost(id, costCatalog, fastMode && supportsFastServiceTier(model))
 		: { ...ZERO_COST };
 
+	const catalogMaxTokens = finiteNumber(model.max_completion_tokens);
+	const maxTokens =
+		catalogMaxTokens !== undefined && catalogMaxTokens > 0 ? Math.floor(catalogMaxTokens) : DEFAULT_MAX_TOKENS;
+	const capped = applyContextCap(id, contextWindow, maxTokens);
+
 	return {
 		id,
 		name: (model.display_name ?? model.name ?? id).trim() || id,
 		reasoning: hasReasoning,
 		input: buildInputModalities(model),
 		cost,
-		contextWindow,
-		maxTokens: DEFAULT_MAX_TOKENS,
+		contextWindow: capped.contextWindow,
+		maxTokens: capped.maxTokens,
 		thinkingLevelMap: buildThinkingLevelMap(efforts),
 	};
 }
@@ -854,6 +940,7 @@ export async function loadMappedModels(
 	agentDir?: string,
 	signal?: AbortSignal,
 ): Promise<MappedModels> {
+	reloadCapConfig();
 	const pricingEnabled = typeof timeoutOrFastMode === "boolean";
 	const effectiveFastMode = typeof timeoutOrFastMode === "boolean" ? timeoutOrFastMode : false;
 	const timeoutMs = typeof timeoutOrFastMode === "number" ? timeoutOrFastMode : MODELS_REQUEST_TIMEOUT_MS;
@@ -899,13 +986,25 @@ export async function resolveMappedModels(
 		shouldCommit?: () => boolean;
 	} = {},
 ): Promise<ResolvedModelsResult> {
+	reloadCapConfig();
 	const cacheMatchesFastMode = (cache: ModelsCacheFile): boolean =>
 		options.fastMode === undefined || (cache.fastMode ?? false) === options.fastMode;
 
 	if (!options.forceRefresh) {
 		const cache = loadModelsCache(agentDir, baseUrlInput);
 		if (cache && cacheMatchesFastMode(cache)) {
-			return { loaded: cache, fromCache: true };
+			return {
+				loaded: {
+					...cache,
+					models: cache.models.map((model) => {
+						const capped = applyContextCap(model.id, model.contextWindow, model.maxTokens);
+						return capped.contextWindow === model.contextWindow && capped.maxTokens === model.maxTokens
+							? model
+							: { ...model, ...capped };
+					}),
+				},
+				fromCache: true,
+			};
 		}
 	}
 
