@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Api, type AssistantMessage, isContextOverflow, type Model } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, type ExtensionContext, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
 	PROACTIVE_COMPACTION_ERROR_PREFIX,
 	ProactiveCompactionController,
@@ -12,6 +12,17 @@ import {
 	shouldScheduleProactiveCompaction,
 } from "../extensions/auto-compact.ts";
 import type { CliproxyCodexStreamSimple } from "../extensions/codex-stream.ts";
+
+// Isolate the shared context-cap config so a developer's real
+// ~/.pi/agent/extensions/context-cap.json cannot change compaction reserves here.
+const isolatedCapAgentDir = mkdtempSync(join(tmpdir(), "pi-cliproxyapi-auto-compact-cap-"));
+beforeAll(() => {
+	vi.stubEnv("PI_AGENT_DIR", isolatedCapAgentDir);
+});
+afterAll(() => {
+	vi.unstubAllEnvs();
+	rmSync(isolatedCapAgentDir, { recursive: true, force: true });
+});
 
 const CONTEXT_WINDOW = 372000;
 const RESERVE_TOKENS = 65536;

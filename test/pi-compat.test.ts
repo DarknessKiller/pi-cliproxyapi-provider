@@ -22,8 +22,10 @@ const CLIPROXYAPI_ENV_NAMES = [
 async function withTempAgentDir(run: (agentDir: string) => Promise<void>): Promise<void> {
 	const agentDir = mkdtempSync(join(tmpdir(), "pi-cliproxyapi-extension-test-"));
 	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const previousCapAgentDir = process.env.PI_AGENT_DIR;
 	const previousEnv = new Map(CLIPROXYAPI_ENV_NAMES.map((name) => [name, process.env[name]]));
 	process.env.PI_CODING_AGENT_DIR = agentDir;
+	process.env.PI_AGENT_DIR = agentDir;
 	for (const name of CLIPROXYAPI_ENV_NAMES) delete process.env[name];
 
 	try {
@@ -33,6 +35,11 @@ async function withTempAgentDir(run: (agentDir: string) => Promise<void>): Promi
 			delete process.env.PI_CODING_AGENT_DIR;
 		} else {
 			process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		}
+		if (previousCapAgentDir === undefined) {
+			delete process.env.PI_AGENT_DIR;
+		} else {
+			process.env.PI_AGENT_DIR = previousCapAgentDir;
 		}
 		for (const [name, value] of previousEnv) {
 			if (value === undefined) {
