@@ -1,13 +1,15 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { Api, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, type ExtensionContext, FooterComponent } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import {
 	applyFastPayloadHook,
 	type CliproxyCodexStreamSimple,
+	loadCliproxyCodexStreams,
 	patchCodexSource,
+	resolveCodexModuleFromNodeEntry,
 	withPriorityServiceTier,
 	wrapStreamSimpleForFast,
 } from "../extensions/codex-stream.ts";
@@ -21,26 +23,121 @@ const model = {
 	provider: "cliproxyapi",
 } as Model<Api>;
 
+describe("Codex protocol module resolution", () => {
+	it("finds pi-ai nested beneath pi's bundled Node package", () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-cliproxyapi-codex-resolution-test-")));
+		const cliEntry = join(root, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js");
+		const codexModule = join(
+			root,
+			"node_modules",
+			"@earendil-works",
+			"pi-coding-agent",
+			"node_modules",
+			"@earendil-works",
+			"pi-ai",
+			"dist",
+			"api",
+			"openai-codex-responses.js",
+		);
+
+		try {
+			mkdirSync(dirname(cliEntry), { recursive: true });
+			mkdirSync(dirname(codexModule), { recursive: true });
+			writeFileSync(cliEntry, "", "utf8");
+			writeFileSync(codexModule, "", "utf8");
+
+			expect(resolveCodexModuleFromNodeEntry(cliEntry)).toBe(codexModule);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("Codex WebSocket transport patch", () => {
-	it("reconnects WebSocket instead of falling back to SSE", () => {
+	it("falls back to SSE after exhausting WebSocket retries before stream start (Issue #33)", () => {
 		const source = readFileSync(
 			new URL("../node_modules/@earendil-works/pi-ai/dist/api/openai-codex-responses.js", import.meta.url),
 			"utf8",
 		);
 		const patched = patchCodexSource(source, ["cliproxyapi"]);
 
-		expect(patched).toContain("const websocketDisabledForSession = false;");
+		// WebSocket retries are still attempted before message stream start
 		expect(patched).toContain("let websocketRetries = 0;");
-		expect(patched).toContain("const connectionLimitBeforeStart = !websocketStarted");
-		expect(patched).toContain("isCodexNonTransportError(error) && !connectionLimitBeforeStart");
-		expect(patched).toContain("const previousResponseNotFound = isPreviousResponseNotFoundError(error);");
-		expect(patched).toContain("recordWebSocketFailure(cacheSessionId, error);");
 		expect(patched).toContain("const maxWebSocketRetries = Number.isFinite(options?.maxRetries)");
 		expect(patched).toContain("? Math.min(Math.max(0, Math.floor(options.maxRetries)), 5)");
 		expect(patched).toContain(": 3;");
-		expect(patched).not.toContain('fallbackTransport: websocketStarted ? undefined : "sse",');
-		expect(patched).not.toContain("websocketSseFallbackSessions.add(sessionId);");
-		expect(patched).not.toMatch(/recordWebSocketSseFallback\([^)]*\);\s*break;/);
+
+		// When retries are exhausted before start, it must fall back to SSE instead of throwing
+		expect(patched).toContain('fallbackTransport: websocketStarted ? undefined : "sse"');
+		expect(patched).toContain("websocketSseFallbackSessions.add(sessionId);");
+		expect(patched).toMatch(/recordWebSocketSseFallback\([^)]*\);\s*break;/);
+		expect(patched).not.toContain("const websocketDisabledForSession = false;");
+		expect(patched).toContain("isWebSocketSseFallbackActive(");
+		expect(patched).toContain('(process.env.CLIPROXYAPI_TRANSPORT || options?.transport || "auto")');
+		expect(patched).toContain("export function closeOpenAICodexWebSocketSessions(sessionId)");
+	});
+
+	it("extends WebSocket idle TTL to 30 minutes to preserve implicit cache (Issue #33)", () => {
+		const source = readFileSync(
+			new URL("../node_modules/@earendil-works/pi-ai/dist/api/openai-codex-responses.js", import.meta.url),
+			"utf8",
+		);
+		const patched = patchCodexSource(source, ["cliproxyapi"]);
+
+		expect(patched).not.toContain("const SESSION_WEBSOCKET_CACHE_TTL_MS = 5 * 60 * 1000;");
+		expect(patched).toMatch(/SESSION_WEBSOCKET_CACHE_TTL_MS\s*=.*30\s*\*\s*60\s*\*\s*1000/);
+	});
+
+	it("falls back to SSE fetch when WebSocket connect fails before start (Issue #33)", async () => {
+		const streams = await loadCliproxyCodexStreams(["cliproxyapi"]);
+		let fetchCalls = 0;
+		const customFetch = async () => {
+			fetchCalls++;
+			return new Response("", { status: 500, statusText: "Server Error" });
+		};
+
+		const testModel = {
+			id: "gpt-5.4",
+			provider: "cliproxyapi",
+			baseUrl: "http://127.0.0.1:19999",
+			input: ["text"],
+		} as unknown as Model<Api>;
+
+		const stream1 = streams.streamSimple(
+			testModel,
+			{ messages: [{ role: "user", content: "hi", timestamp: Date.now() }] },
+			{
+				apiKey: "test-api-key",
+				sessionId: "test-ws-fallback-sess",
+				websocketConnectTimeoutMs: 50,
+				fetch: customFetch as unknown as typeof fetch,
+				maxRetries: 0,
+			},
+		);
+
+		await stream1.result();
+		expect(fetchCalls).toBe(1);
+
+		// Subsequent request in same session uses sticky SSE and calls fetch directly
+		const stream2 = streams.streamSimple(
+			testModel,
+			{ messages: [{ role: "user", content: "turn 2", timestamp: Date.now() }] },
+			{
+				apiKey: "test-api-key",
+				sessionId: "test-ws-fallback-sess",
+				fetch: customFetch as unknown as typeof fetch,
+				maxRetries: 0,
+			},
+		);
+
+		await stream2.result();
+		expect(fetchCalls).toBe(2);
+	});
+
+	it("exports closeOpenAICodexWebSocketSessions from the patched module instance", async () => {
+		const streams = await loadCliproxyCodexStreams(["cliproxyapi"]);
+		expect(typeof (streams as any).closeOpenAICodexWebSocketSessions).toBe("function");
+		expect(() => (streams as any).closeOpenAICodexWebSocketSessions("missing-session")).not.toThrow();
 	});
 });
 

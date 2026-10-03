@@ -18,10 +18,22 @@
  * Non-interactive setup still works via env vars or ~/.pi/agent/cliproxyapi.json.
  */
 
-import type { Api, Model, OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
+import type {
+	Api,
+	Model,
+	OAuthCredentials,
+	OAuthLoginCallbacks,
+	SimpleStreamOptions,
+	StreamFunction,
+} from "@earendil-works/pi-ai";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { ProactiveCompactionController } from "./auto-compact.ts";
-import { CLIPROXYAPI_CODEX_API, type CliproxyCodexStreamSimple, loadCliproxyCodexStreams } from "./codex-stream.ts";
+import {
+	applyFastPayloadHook,
+	CLIPROXYAPI_CODEX_API,
+	type CliproxyCodexStreamSimple,
+	loadCliproxyCodexStreams,
+} from "./codex-stream.ts";
 import { FastModeController } from "./fast.ts";
 import { FastFooterController } from "./fast-footer.ts";
 import {
@@ -31,9 +43,12 @@ import {
 	decodeRefreshMeta,
 	encodeRefreshMeta,
 	firstNonEmpty,
+	isModelReferencedAsDefault,
 	isUnauthorizedModelsError,
 	loadAuthConnection,
 	loadConfigFile,
+	loadConfiguredDefaultSettings,
+	type MappedModels,
 	type PiProviderModel,
 	resolveConnection,
 	resolveEndpoints,
@@ -58,13 +73,28 @@ class ConfigPersistenceError extends Error {
 interface RefreshResult {
 	modelCount: number;
 	modelsUrl: string;
+	staleCount?: number;
+}
+
+export const DEFAULT_AUTO_RECOVERY_DELAY_MS = 60_000;
+export const MAX_AUTO_RECOVERY_DELAY_MS = 300_000;
+
+export interface RecoverySnapshot {
+	action: () => Promise<unknown>;
+	attempt: number;
+	delayMs: number;
 }
 
 class ModelRefreshCoordinator {
 	private generation = 0;
 	private activeController: AbortController | undefined;
+	private recoveryTimer: NodeJS.Timeout | undefined;
+	private recoveryAttempt = 0;
+	private activeRecovery: RecoverySnapshot | undefined;
+	private stopped = false;
 
 	begin(): { generation: number; signal: AbortSignal } {
+		this.clearRecoveryTimer();
 		this.activeController?.abort();
 		const controller = new AbortController();
 		this.activeController = controller;
@@ -73,7 +103,83 @@ class ModelRefreshCoordinator {
 	}
 
 	isCurrent(generation: number): boolean {
-		return this.generation === generation;
+		return !this.stopped && this.generation === generation;
+	}
+
+	scheduleRecovery(
+		action: () => Promise<unknown>,
+		baseDelayMs = DEFAULT_AUTO_RECOVERY_DELAY_MS,
+		maxDelayMs = MAX_AUTO_RECOVERY_DELAY_MS,
+	): void {
+		if (this.stopped) return;
+		this.clearRecoveryTimer();
+		const delay = Math.min(baseDelayMs * 1.5 ** this.recoveryAttempt, maxDelayMs);
+		this.recoveryAttempt += 1;
+		this.activeRecovery = { action, attempt: this.recoveryAttempt, delayMs: delay };
+
+		this.recoveryTimer = setTimeout(() => {
+			this.recoveryTimer = undefined;
+			if (this.stopped) return;
+			void action().catch((error) => {
+				const message = error instanceof Error ? error.message : String(error);
+				if (message.includes("is stale after session replacement or reload")) {
+					this.clearRecovery();
+					return;
+				}
+				// Suppressed: logging this into the TUI corrupts the display.
+				// The refresh path already reschedules the next attempt.
+			});
+		}, delay);
+		this.recoveryTimer.unref?.();
+	}
+
+	snapshotRecovery(): RecoverySnapshot | undefined {
+		if (!this.stopped && this.activeRecovery) {
+			return { ...this.activeRecovery };
+		}
+		return undefined;
+	}
+
+	restoreRecovery(snapshot: RecoverySnapshot): void {
+		if (this.stopped || !snapshot) return;
+		this.clearRecoveryTimer();
+		this.recoveryAttempt = snapshot.attempt;
+		this.activeRecovery = snapshot;
+		this.recoveryTimer = setTimeout(() => {
+			this.recoveryTimer = undefined;
+			if (this.stopped) return;
+			void snapshot.action().catch((error) => {
+				const message = error instanceof Error ? error.message : String(error);
+				if (message.includes("is stale after session replacement or reload")) {
+					this.clearRecovery();
+					return;
+				}
+				// Suppressed: logging this into the TUI corrupts the display.
+				// The refresh path already reschedules the next attempt.
+			});
+		}, snapshot.delayMs);
+		this.recoveryTimer.unref?.();
+	}
+
+	clearRecoveryTimer(): void {
+		if (this.recoveryTimer) {
+			clearTimeout(this.recoveryTimer);
+			this.recoveryTimer = undefined;
+		}
+	}
+
+	clearRecovery(): void {
+		this.clearRecoveryTimer();
+		this.recoveryAttempt = 0;
+		this.activeRecovery = undefined;
+	}
+
+	stop(): void {
+		this.stopped = true;
+		this.clearRecovery();
+		this.activeController?.abort();
+		this.activeController = undefined;
+		this.generation += 1;
 	}
 }
 
@@ -83,6 +189,45 @@ function logWarn(message: string): void {
 
 function logInfo(message: string): void {
 	console.info(`[pi-cliproxyapi-provider] ${message}`);
+}
+
+const COMPAT_COORDINATOR_KEY = Symbol.for("pi-cliproxyapi-provider.compat-coordinator");
+export const COMPAT_SOURCE_ID = "pi-cliproxyapi-provider-global";
+
+interface CompatRegistrationEntry {
+	instanceId: string;
+	providerId: string;
+	rawStream: CliproxyCodexStreamSimple;
+	rawStreamSimple: CliproxyCodexStreamSimple;
+}
+
+interface CompatCoordinator {
+	stack: CompatRegistrationEntry[];
+}
+
+function getCompatCoordinator(): CompatCoordinator {
+	const globalState = globalThis as unknown as { [COMPAT_COORDINATOR_KEY]?: CompatCoordinator };
+	if (!globalState[COMPAT_COORDINATOR_KEY]) {
+		globalState[COMPAT_COORDINATOR_KEY] = { stack: [] };
+	}
+	return globalState[COMPAT_COORDINATOR_KEY]!;
+}
+
+export function resetCompatCoordinator(): void {
+	const coordinator = getCompatCoordinator();
+	coordinator.stack = [];
+}
+
+function findActiveCompatEntry(
+	stack: CompatRegistrationEntry[],
+	providerId: string,
+): CompatRegistrationEntry | undefined {
+	for (let i = stack.length - 1; i >= 0; i--) {
+		if (stack[i].providerId === providerId) {
+			return stack[i];
+		}
+	}
+	return undefined;
 }
 
 function hasLoginCredential(agentDir: string, providerId: string): boolean {
@@ -166,6 +311,7 @@ async function configureAndRegister(options: {
 	fastMode: FastModeController;
 	refreshCoordinator: ModelRefreshCoordinator;
 	onFastModeChange?: (enabled: boolean, ctx: ExtensionContext) => Promise<void>;
+	onRefreshOutcome?: (loaded: MappedModels) => void;
 }): Promise<RefreshResult> {
 	const {
 		pi,
@@ -179,6 +325,7 @@ async function configureAndRegister(options: {
 		fastMode,
 		refreshCoordinator,
 		onFastModeChange,
+		onRefreshOutcome,
 	} = options;
 
 	const refresh = refreshCoordinator.begin();
@@ -216,10 +363,18 @@ async function configureAndRegister(options: {
 		fastMode,
 		refreshCoordinator,
 		onFastModeChange,
+		onRefreshOutcome,
 	});
 	fastMode.setSupportedModelIds(loaded.fastModelIds);
 
-	return { modelCount: loaded.models.length, modelsUrl: loaded.modelsUrl };
+	onRefreshOutcome?.(loaded);
+	const staleModels = loaded.models.filter((m) => m.stale);
+
+	return {
+		modelCount: loaded.models.length,
+		modelsUrl: loaded.modelsUrl,
+		staleCount: staleModels.length,
+	};
 }
 
 function createOAuthHandlers(options: {
@@ -232,6 +387,7 @@ function createOAuthHandlers(options: {
 	fastMode: FastModeController;
 	refreshCoordinator: ModelRefreshCoordinator;
 	onFastModeChange?: (enabled: boolean, ctx: ExtensionContext) => Promise<void>;
+	onRefreshOutcome?: (loaded: MappedModels) => void;
 }) {
 	const {
 		pi,
@@ -243,6 +399,7 @@ function createOAuthHandlers(options: {
 		fastMode,
 		refreshCoordinator,
 		onFastModeChange,
+		onRefreshOutcome,
 	} = options;
 
 	return {
@@ -259,6 +416,7 @@ function createOAuthHandlers(options: {
 				});
 
 				callbacks.onProgress?.("Validating credentials via models endpoint...");
+				const previousRecovery = refreshCoordinator.snapshotRecovery();
 				try {
 					const result = await configureAndRegister({
 						pi,
@@ -272,11 +430,15 @@ function createOAuthHandlers(options: {
 						fastMode,
 						refreshCoordinator,
 						onFastModeChange,
+						onRefreshOutcome,
 					});
 
 					logInfo(`login ok: registered ${result.modelCount} models from ${result.modelsUrl}`);
 					return buildOAuthCredentials(baseUrlInput, apiKey);
 				} catch (error) {
+					if (previousRecovery) {
+						refreshCoordinator.restoreRecovery(previousRecovery);
+					}
 					const message = error instanceof Error ? error.message : String(error);
 					logWarn(`login validation failed: ${message}`);
 					if (error instanceof ConfigPersistenceError) {
@@ -333,6 +495,7 @@ function registerProvider(
 		fastMode: FastModeController;
 		refreshCoordinator?: ModelRefreshCoordinator;
 		onFastModeChange?: (enabled: boolean, ctx: ExtensionContext) => Promise<void>;
+		onRefreshOutcome?: (loaded: MappedModels) => void;
 	},
 ): void {
 	const {
@@ -346,6 +509,7 @@ function registerProvider(
 		streamSimple,
 		fastMode,
 		onFastModeChange,
+		onRefreshOutcome,
 	} = options;
 	const refreshCoordinator = options.refreshCoordinator ?? new ModelRefreshCoordinator();
 
@@ -360,6 +524,7 @@ function registerProvider(
 		fastMode,
 		refreshCoordinator,
 		onFastModeChange,
+		onRefreshOutcome,
 	});
 
 	// Replace any previous registration so an earlier ambient apiKey does not linger
@@ -577,10 +742,19 @@ export function registerRefreshCommand(options: {
 						refreshCoordinator,
 					});
 
-					result = { modelCount: loaded.models.length, modelsUrl: loaded.modelsUrl };
+					result = {
+						modelCount: loaded.models.length,
+						modelsUrl: loaded.modelsUrl,
+						staleCount: loaded.models.filter((m) => m.stale).length,
+					};
 				}
 
-				ctx.ui.notify(`Refreshed ${result.modelCount} CLIProxyAPI models from ${result.modelsUrl}.`, "info");
+				const staleSuffix =
+					result.staleCount && result.staleCount > 0 ? ` (${result.staleCount} retained from cache)` : "";
+				ctx.ui.notify(
+					`Refreshed ${result.modelCount} CLIProxyAPI models${staleSuffix} from ${result.modelsUrl}.`,
+					"info",
+				);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				ctx.ui.notify(`Failed to refresh CLIProxyAPI models: ${message}`, "error");
@@ -621,16 +795,102 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const fastMode = new FastModeController(fastEnabled);
 	const modelRefreshCoordinator = new ModelRefreshCoordinator();
 
-	let streamSimple: CliproxyCodexStreamSimple;
+	let streamSimple: CliproxyCodexStreamSimple = () => {
+		throw new Error(
+			`Codex protocol stream is unavailable for provider: ${identity.providerId} (api: ${CLIPROXYAPI_CODEX_API})`,
+		);
+	};
 	try {
 		const streams = await loadCliproxyCodexStreams([identity.providerId, "cliproxyapi"], {
 			shouldUseFast: (model) => model.provider === identity.providerId && fastMode.isEffectiveFor(model.id),
 		});
+		proactiveCompaction.setCloseWebSocketSessions(streams.closeOpenAICodexWebSocketSessions);
 		streamSimple = proactiveCompaction.wrapStreamSimple(streams.streamSimple);
+
+		pi.on("session_shutdown", () => {
+			try {
+				streams.closeOpenAICodexWebSocketSessions();
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				logWarn(`failed to close Codex WebSocket sessions on shutdown: ${message}`);
+			}
+		});
+
+		try {
+			const { registerApiProvider, unregisterApiProviders } = await import("@earendil-works/pi-ai/compat");
+
+			const coordinator = getCompatCoordinator();
+			const instanceId = `${identity.providerId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+			const entry: CompatRegistrationEntry = {
+				instanceId,
+				providerId: identity.providerId,
+				rawStream: streams.rawStream,
+				rawStreamSimple: streams.rawStreamSimple,
+			};
+
+			coordinator.stack.push(entry);
+
+			const dispatchStream: CliproxyCodexStreamSimple = (model, context, options) => {
+				const active = findActiveCompatEntry(coordinator.stack, model.provider);
+				if (!active) {
+					throw new Error(
+						`No active provider stream handler registered for provider: ${model.provider} (api: ${CLIPROXYAPI_CODEX_API})`,
+					);
+				}
+				const shouldFast = (options as any)?.serviceTier === "priority" || (options as any)?.fast === true;
+				if (shouldFast) {
+					return active.rawStream(model, context, {
+						...options,
+						onPayload: (payload, payloadModel) => applyFastPayloadHook(payload, payloadModel, options?.onPayload),
+					});
+				}
+				return active.rawStream(model, context, options);
+			};
+
+			const dispatchStreamSimple: CliproxyCodexStreamSimple = (model, context, options) => {
+				const active = findActiveCompatEntry(coordinator.stack, model.provider);
+				if (!active) {
+					throw new Error(
+						`No active provider streamSimple handler registered for provider: ${model.provider} (api: ${CLIPROXYAPI_CODEX_API})`,
+					);
+				}
+				const shouldFast = (options as any)?.serviceTier === "priority" || (options as any)?.fast === true;
+				if (shouldFast) {
+					return active.rawStreamSimple(model, context, {
+						...options,
+						onPayload: (payload, payloadModel) => applyFastPayloadHook(payload, payloadModel, options?.onPayload),
+					});
+				}
+				return active.rawStreamSimple(model, context, options);
+			};
+
+			unregisterApiProviders(COMPAT_SOURCE_ID);
+			registerApiProvider(
+				{
+					api: CLIPROXYAPI_CODEX_API,
+					stream: dispatchStream as StreamFunction<typeof CLIPROXYAPI_CODEX_API>,
+					streamSimple: dispatchStreamSimple as StreamFunction<typeof CLIPROXYAPI_CODEX_API, SimpleStreamOptions>,
+				},
+				COMPAT_SOURCE_ID,
+			);
+
+			pi.on("session_shutdown", () => {
+				const index = coordinator.stack.findIndex((item) => item.instanceId === instanceId);
+				if (index !== -1) {
+					coordinator.stack.splice(index, 1);
+				}
+				if (coordinator.stack.length === 0) {
+					unregisterApiProviders(COMPAT_SOURCE_ID);
+				}
+			});
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			logWarn(`failed to register compat API provider: ${message}`);
+		}
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		logWarn(`failed to load patched codex protocol: ${message}`);
-		return;
 	}
 
 	const fastFooter = new FastFooterController(identity.providerId, fastMode, (maxTokens) =>
@@ -650,6 +910,32 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	});
 	fastFooter.register(pi);
 
+	const scheduleActiveRecovery = (): void => {
+		modelRefreshCoordinator.scheduleRecovery(async () => {
+			const activeConn = resolveConnection(agentDir, identity.providerId);
+			if (!activeConn) {
+				modelRefreshCoordinator.clearRecovery();
+				return;
+			}
+			await registerConfiguredProvider(activeConn, { forceRefresh: true });
+		}, DEFAULT_AUTO_RECOVERY_DELAY_MS);
+	};
+
+	const handleRefreshOutcome = (loaded: MappedModels): void => {
+		const staleModels = loaded.models.filter((m) => m.stale);
+		latestStaleModelIds = staleModels.map((m) => m.id);
+
+		if (staleModels.length > 0) {
+			if (activeContext) {
+				checkAndNotifyStaleModel(activeContext);
+			}
+			scheduleActiveRecovery();
+		} else {
+			notifiedStaleModelId = undefined;
+			modelRefreshCoordinator.clearRecovery();
+		}
+	};
+
 	// Always register oauth so the provider is visible in /login immediately after install.
 	registerProvider(pi, {
 		providerId: identity.providerId,
@@ -661,12 +947,59 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		fastMode,
 		refreshCoordinator: modelRefreshCoordinator,
 		onFastModeChange: onFastModeChange,
+		onRefreshOutcome: handleRefreshOutcome,
 	});
 	registerTransientNetworkErrorRetry(pi, identity.providerId);
 
+	let activeContext: ExtensionContext | undefined;
+	let latestStaleModelIds: string[] = [];
+	let notifiedStaleModelId: string | undefined;
+
+	const checkAndNotifyStaleModel = (ctx: ExtensionContext): void => {
+		try {
+			const currentModel = ctx.model;
+			const configured = loadConfiguredDefaultSettings(agentDir);
+			const affectedStaleId = latestStaleModelIds.find(
+				(staleId) =>
+					(currentModel && currentModel.provider === identity.providerId && currentModel.id === staleId) ||
+					isModelReferencedAsDefault(configured, staleId, identity.providerId),
+			);
+
+			if (affectedStaleId) {
+				if (notifiedStaleModelId !== affectedStaleId) {
+					notifiedStaleModelId = affectedStaleId;
+					ctx.ui.notify(
+						`Model '${affectedStaleId}' is temporarily unavailable from upstream (retaining cached entry).`,
+						"warning",
+					);
+				}
+			} else {
+				notifiedStaleModelId = undefined;
+			}
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			if (message.includes("is stale after session replacement or reload")) {
+				activeContext = undefined;
+				return;
+			}
+			throw error;
+		}
+	};
+
+	pi.on("session_start", (_event, ctx) => {
+		activeContext = ctx;
+		checkAndNotifyStaleModel(ctx);
+	});
+	pi.on("session_shutdown", () => {
+		activeContext = undefined;
+		latestStaleModelIds = [];
+		notifiedStaleModelId = undefined;
+		modelRefreshCoordinator.stop();
+	});
+
 	const connection = resolveConnection(agentDir, identity.providerId);
 	const registerConfiguredProvider = async (
-		currentConnection: NonNullable<ReturnType<typeof resolveConnection>>,
+		currentConnection: { baseUrlInput: string; apiKey: string },
 		options: { forceRefresh?: boolean } = {},
 	): Promise<RefreshResult | undefined> => {
 		const refresh = modelRefreshCoordinator.begin();
@@ -702,18 +1035,42 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				fastMode,
 				refreshCoordinator: modelRefreshCoordinator,
 				onFastModeChange,
+				onRefreshOutcome: handleRefreshOutcome,
 			});
 
-			if (fromCache && !options.forceRefresh) {
-				void registerConfiguredProvider(currentConnection, { forceRefresh: true }).catch((error) => {
-					const message = error instanceof Error ? error.message : String(error);
-					logWarn(`failed to refresh cached models (${message}); keeping the cached model list.`);
-				});
+			if (fromCache) {
+				const cachedStaleModels = loaded.models.filter((m) => m.stale);
+				if (cachedStaleModels.length > 0) {
+					latestStaleModelIds = cachedStaleModels.map((m) => m.id);
+					if (activeContext) {
+						checkAndNotifyStaleModel(activeContext);
+					}
+				}
+				if (!options.forceRefresh) {
+					void registerConfiguredProvider(currentConnection, { forceRefresh: true }).catch((error) => {
+						const message = error instanceof Error ? error.message : String(error);
+						logWarn(`failed to refresh cached models (${message}); keeping the cached model list.`);
+					});
+				}
+			} else {
+				handleRefreshOutcome(loaded);
 			}
 
-			return { modelCount: loaded.models.length, modelsUrl: loaded.modelsUrl };
+			return {
+				modelCount: loaded.models.length,
+				modelsUrl: loaded.modelsUrl,
+				staleCount: loaded.models.filter((m) => m.stale).length,
+			};
 		} catch (error) {
 			if (!modelRefreshCoordinator.isCurrent(refresh.generation)) return undefined;
+			const message = error instanceof Error ? error.message : String(error);
+			if (message.includes("is stale after session replacement or reload")) {
+				modelRefreshCoordinator.clearRecovery();
+				return undefined;
+			}
+			if (options.forceRefresh) {
+				scheduleActiveRecovery();
+			}
 			throw error;
 		}
 	};

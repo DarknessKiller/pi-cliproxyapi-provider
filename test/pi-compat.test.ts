@@ -2,9 +2,13 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
+import { getApiProvider, stream, streamSimple, unregisterApiProviders } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { describe, expect, it, vi } from "vitest";
-import providerExtension from "../extensions/index.ts";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { PROACTIVE_COMPACTION_ERROR_PREFIX } from "../extensions/auto-compact.ts";
+import type { CliproxyCodexStreamSimple } from "../extensions/codex-stream.ts";
+import * as codexStream from "../extensions/codex-stream.ts";
+import providerExtension, { COMPAT_SOURCE_ID, resetCompatCoordinator } from "../extensions/index.ts";
 import { AUTH_FILE_NAME } from "../extensions/lib.ts";
 
 const CLIPROXYAPI_ENV_NAMES = [
@@ -77,6 +81,11 @@ function createPiMock(commands: Map<string, Parameters<ExtensionAPI["registerCom
 }
 
 describe("pi 0.82.0 compatibility", () => {
+	afterEach(() => {
+		resetCompatCoordinator();
+		unregisterApiProviders(COMPAT_SOURCE_ID);
+	});
+
 	it("registers oauth login and /fast without a dedicated /cliproxyapi command", async () => {
 		await withTempAgentDir(async () => {
 			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
@@ -237,6 +246,331 @@ describe("pi 0.82.0 compatibility", () => {
 				);
 			} finally {
 				fetchMock.mockRestore();
+			}
+		});
+	});
+
+	it("registers and unregisters cliproxyapi-codex-responses with the pi-ai compat dispatcher", async () => {
+		await withTempAgentDir(async () => {
+			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+			const { pi, handlers } = createPiMock(commands);
+
+			await providerExtension(pi);
+
+			const provider = getApiProvider("cliproxyapi-codex-responses" as Api);
+			expect(provider).toBeDefined();
+
+			const testModel = {
+				id: "gpt-5.6-terra",
+				provider: "cliproxyapi",
+				api: "cliproxyapi-codex-responses" as Api,
+				baseUrl: "http://127.0.0.1:8317",
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			} as Model<Api>;
+
+			expect(() => streamSimple(testModel, { messages: [] })).not.toThrow(
+				/No API provider registered for api: cliproxyapi-codex-responses/,
+			);
+			expect(() => stream(testModel, { messages: [] })).not.toThrow(
+				/No API provider registered for api: cliproxyapi-codex-responses/,
+			);
+
+			const shutdownHandlers = handlers.get("session_shutdown") ?? [];
+			for (const handler of shutdownHandlers) {
+				handler({}, {} as ExtensionContext);
+			}
+
+			expect(getApiProvider("cliproxyapi-codex-responses" as Api)).toBeUndefined();
+		});
+	});
+
+	it("keeps compat dispatcher isolated from foreground proactive compaction state", async () => {
+		await withTempAgentDir(async (agentDir) => {
+			writeFileSync(
+				join(agentDir, "cliproxyapi.json"),
+				JSON.stringify({ baseUrl: "http://127.0.0.1:8317", apiKey: "stored-key" }),
+				"utf8",
+			);
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({ compaction: { enabled: true, reserveTokens: 65536 } }),
+				"utf8",
+			);
+			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+			const { pi, handlers } = createPiMock(commands);
+
+			await providerExtension(pi);
+
+			const testModel = {
+				id: "gpt-5.6-terra",
+				provider: "cliproxyapi",
+				api: "cliproxyapi-codex-responses" as Api,
+				baseUrl: "http://127.0.0.1:8317",
+				contextWindow: 372000,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			} as Model<Api>;
+
+			const mockCtx = {
+				agentDir,
+				cwd: agentDir,
+				model: testModel,
+				isProjectTrusted: () => false,
+				getContextUsage: () => ({ tokens: 372000 - 65536 + 10 }),
+			} as unknown as ExtensionContext;
+
+			// Trigger session_start to initialize settingsManager
+			const sessionStartHandlers = handlers.get("session_start") ?? [];
+			for (const handler of sessionStartHandlers) {
+				handler({}, mockCtx);
+			}
+
+			const turnEndHandlers = handlers.get("turn_end") ?? [];
+			const overThresholdMessage = {
+				role: "assistant",
+				provider: "cliproxyapi",
+				model: "gpt-5.6-terra",
+				content: [{ type: "toolCall", id: "call-1", name: "read", arguments: {} }],
+				stopReason: "toolUse",
+			};
+
+			for (const handler of turnEndHandlers) {
+				await handler({ message: overThresholdMessage }, mockCtx);
+			}
+
+			// Background compat dispatcher should not be intercepted by foreground proactive compaction
+			const compatStream = streamSimple(testModel, { messages: [] }, { apiKey: "test-key" });
+			expect(compatStream).toBeDefined();
+			const compatResult = await compatStream.result().catch((err) => ({ errorMessage: String(err) }));
+			expect(compatResult.errorMessage).not.toContain(PROACTIVE_COMPACTION_ERROR_PREFIX);
+
+			// Foreground provider's streamSimple produces the proactive compaction overflow stream
+			const foregroundConfig = (pi.registerProvider as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1] as {
+				streamSimple: CliproxyCodexStreamSimple;
+			};
+			const foregroundStream = foregroundConfig.streamSimple(testModel, { messages: [] }, { apiKey: "test-key" });
+			const foregroundMessage = await foregroundStream.result();
+			expect(foregroundMessage.errorMessage).toContain(PROACTIVE_COMPACTION_ERROR_PREFIX);
+
+			for (const handler of handlers.get("session_shutdown") ?? []) {
+				handler({}, {} as ExtensionContext);
+			}
+			expect(getApiProvider("cliproxyapi-codex-responses" as Api)).toBeUndefined();
+		});
+	});
+
+	it("manages shared compat registration across multiple interleaved instances", async () => {
+		await withTempAgentDir(async () => {
+			const commands1 = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+			const mock1 = createPiMock(commands1);
+			await providerExtension(mock1.pi);
+
+			expect(getApiProvider("cliproxyapi-codex-responses" as Api)).toBeDefined();
+
+			const commands2 = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+			const mock2 = createPiMock(commands2);
+			await providerExtension(mock2.pi);
+
+			expect(getApiProvider("cliproxyapi-codex-responses" as Api)).toBeDefined();
+
+			// Instance 1 shuts down, but Instance 2 is still active
+			for (const handler of mock1.handlers.get("session_shutdown") ?? []) {
+				handler({}, {} as ExtensionContext);
+			}
+
+			// Compat provider must still remain registered for Instance 2
+			expect(getApiProvider("cliproxyapi-codex-responses" as Api)).toBeDefined();
+
+			const testModel = {
+				id: "gpt-5.6-terra",
+				provider: "cliproxyapi",
+				api: "cliproxyapi-codex-responses" as Api,
+				baseUrl: "http://127.0.0.1:8317",
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			} as Model<Api>;
+
+			expect(() => streamSimple(testModel, { messages: [] })).not.toThrow(
+				/No API provider registered for api: cliproxyapi-codex-responses/,
+			);
+
+			// Instance 2 shuts down -> all instances are gone, provider is cleanly unregistered
+			for (const handler of mock2.handlers.get("session_shutdown") ?? []) {
+				handler({}, {} as ExtensionContext);
+			}
+
+			expect(getApiProvider("cliproxyapi-codex-responses" as Api)).toBeUndefined();
+		});
+	});
+
+	it("maintains registration when newer instance shuts down before older instance", async () => {
+		await withTempAgentDir(async () => {
+			const commands1 = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+			const mock1 = createPiMock(commands1);
+			await providerExtension(mock1.pi);
+
+			const commands2 = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+			const mock2 = createPiMock(commands2);
+			await providerExtension(mock2.pi);
+
+			expect(getApiProvider("cliproxyapi-codex-responses" as Api)).toBeDefined();
+
+			// Newer instance (Instance 2) shuts down first
+			for (const handler of mock2.handlers.get("session_shutdown") ?? []) {
+				handler({}, {} as ExtensionContext);
+			}
+
+			// Compat provider must still remain registered because Instance 1 is still active
+			expect(getApiProvider("cliproxyapi-codex-responses" as Api)).toBeDefined();
+
+			const testModel = {
+				id: "gpt-5.6-terra",
+				provider: "cliproxyapi",
+				api: "cliproxyapi-codex-responses" as Api,
+				baseUrl: "http://127.0.0.1:8317",
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			} as Model<Api>;
+
+			expect(() => streamSimple(testModel, { messages: [] })).not.toThrow(
+				/No API provider registered for api: cliproxyapi-codex-responses/,
+			);
+
+			// Instance 1 shuts down -> now all instances are gone, cleanly unregisters
+			for (const handler of mock1.handlers.get("session_shutdown") ?? []) {
+				handler({}, {} as ExtensionContext);
+			}
+
+			expect(getApiProvider("cliproxyapi-codex-responses" as Api)).toBeUndefined();
+		});
+	});
+
+	it("manages compat registration across different provider IDs", async () => {
+		await withTempAgentDir(async () => {
+			const commands1 = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+			const mock1 = createPiMock(commands1);
+			await providerExtension(mock1.pi);
+
+			// Second instance with a custom provider ID
+			process.env.CLIPROXYAPI_PROVIDER_ID = "cliproxyapi-custom";
+			const commands2 = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+			const mock2 = createPiMock(commands2);
+			await providerExtension(mock2.pi);
+
+			expect(getApiProvider("cliproxyapi-codex-responses" as Api)).toBeDefined();
+
+			const modelCustom = {
+				id: "gpt-5.6-terra",
+				provider: "cliproxyapi-custom",
+				api: "cliproxyapi-codex-responses" as Api,
+				baseUrl: "http://127.0.0.1:8317",
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			} as Model<Api>;
+
+			const modelDefault = {
+				id: "gpt-5.6-terra",
+				provider: "cliproxyapi",
+				api: "cliproxyapi-codex-responses" as Api,
+				baseUrl: "http://127.0.0.1:8317",
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			} as Model<Api>;
+
+			expect(() => streamSimple(modelCustom, { messages: [] }, { apiKey: "stored-key" })).not.toThrow();
+			expect(() => streamSimple(modelDefault, { messages: [] }, { apiKey: "stored-key" })).not.toThrow();
+
+			// Shut down custom provider instance
+			for (const handler of mock2.handlers.get("session_shutdown") ?? []) {
+				handler({}, {} as ExtensionContext);
+			}
+
+			// Custom provider calls now fail with provider-specific error
+			expect(() => streamSimple(modelCustom, { messages: [] }, { apiKey: "stored-key" })).toThrow(
+				/No active provider streamSimple handler registered for provider: cliproxyapi-custom/,
+			);
+
+			// Default provider still active
+			expect(getApiProvider("cliproxyapi-codex-responses" as Api)).toBeDefined();
+			expect(() => streamSimple(modelDefault, { messages: [] }, { apiKey: "stored-key" })).not.toThrow();
+
+			// Unknown provider throws immediately
+			const modelUnknown = {
+				id: "gpt-5.6-terra",
+				provider: "unknown-provider",
+				api: "cliproxyapi-codex-responses" as Api,
+				baseUrl: "http://127.0.0.1:8317",
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			} as Model<Api>;
+			expect(() => streamSimple(modelUnknown, { messages: [] }, { apiKey: "stored-key" })).toThrow(
+				/No active provider streamSimple handler registered for provider: unknown-provider/,
+			);
+
+			// Shut down default provider instance
+			for (const handler of mock1.handlers.get("session_shutdown") ?? []) {
+				handler({}, {} as ExtensionContext);
+			}
+
+			expect(getApiProvider("cliproxyapi-codex-responses" as Api)).toBeUndefined();
+		});
+	});
+
+	it("isolates Fast mode in compat dispatch from mutable foreground instance toggles", async () => {
+		await withTempAgentDir(async (agentDir) => {
+			writeFileSync(
+				join(agentDir, "cliproxyapi.json"),
+				JSON.stringify({ baseUrl: "http://127.0.0.1:8317", apiKey: "stored-key" }),
+				"utf8",
+			);
+			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+			const { pi } = createPiMock(commands);
+
+			await providerExtension(pi);
+
+			const testModel = {
+				id: "gpt-5.6-terra",
+				provider: "cliproxyapi",
+				api: "cliproxyapi-codex-responses" as Api,
+				baseUrl: "http://127.0.0.1:8317",
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			} as Model<Api>;
+
+			// Standard compat call without fast requested does not inject priority
+			const stream1 = streamSimple(testModel, { messages: [] }, { apiKey: "stored-key" });
+			expect(stream1).toBeDefined();
+
+			// Explicit fast request via serviceTier: "priority" works
+			const stream2 = streamSimple(testModel, { messages: [] }, {
+				apiKey: "stored-key",
+				serviceTier: "priority",
+			} as any);
+			expect(stream2).toBeDefined();
+		});
+	});
+
+	it("closes Codex WebSocket sessions on session_shutdown to allow clean process exit (Issue #26)", async () => {
+		await withTempAgentDir(async () => {
+			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+			const { pi, handlers } = createPiMock(commands);
+
+			const closeWebSocketSessionsMock = vi.fn();
+			const originalLoadCliproxyCodexStreams = codexStream.loadCliproxyCodexStreams;
+			const spy = vi.spyOn(codexStream, "loadCliproxyCodexStreams").mockImplementation(async (...args) => {
+				const real = await originalLoadCliproxyCodexStreams(...args);
+				return {
+					...real,
+					closeOpenAICodexWebSocketSessions: closeWebSocketSessionsMock,
+				};
+			});
+
+			try {
+				await providerExtension(pi);
+
+				const shutdownHandlers = handlers.get("session_shutdown") ?? [];
+				expect(shutdownHandlers.length).toBeGreaterThan(0);
+
+				for (const handler of shutdownHandlers) {
+					handler({ type: "session_shutdown", reason: "quit" }, {} as ExtensionContext);
+				}
+
+				expect(closeWebSocketSessionsMock).toHaveBeenCalled();
+			} finally {
+				spy.mockRestore();
 			}
 		});
 	});

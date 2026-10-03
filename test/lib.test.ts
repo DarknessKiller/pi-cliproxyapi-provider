@@ -11,6 +11,7 @@ import {
 	type CodexClientModel,
 	DEFAULT_BASE_URL,
 	DEFAULT_CONTEXT_WINDOW,
+	DEFAULT_MAX_TOKENS,
 	DEFAULT_PROVIDER_ID,
 	DEFAULT_PROVIDER_NAME,
 	decodeRefreshMeta,
@@ -18,9 +19,11 @@ import {
 	extractReasoningEfforts,
 	fetchModelsDevCostMap,
 	firstNonEmpty,
+	isModelReferencedAsDefault,
 	isUnauthorizedModelsError,
 	loadAuthConnection,
 	loadConfigFile,
+	loadConfiguredDefaultSettings,
 	ModelsHttpError,
 	matchModelCost,
 	parseBooleanSetting,
@@ -210,6 +213,32 @@ describe("model mapping helpers", () => {
 		const model = toPiModel({ id: "m1" });
 		expect(model?.contextWindow).toBe(DEFAULT_CONTEXT_WINDOW);
 		expect(model?.reasoning).toBe(false);
+	});
+
+	it("derives maxTokens from max_tokens, max_output_tokens, max_completion_tokens or defaults", () => {
+		expect(toPiModel({ id: "m-max-tokens", max_tokens: 128000 })?.maxTokens).toBe(128000);
+		expect(toPiModel({ id: "m-max-output", max_output_tokens: 64000 })?.maxTokens).toBe(64000);
+		expect(toPiModel({ id: "m-max-completion", max_completion_tokens: 32000 })?.maxTokens).toBe(32000);
+		expect(toPiModel({ id: "m-precedence", max_tokens: 128000, max_output_tokens: 64000 })?.maxTokens).toBe(128000);
+		expect(
+			toPiModel({ id: "m-precedence-2", max_output_tokens: 64000, max_completion_tokens: 32000 })?.maxTokens,
+		).toBe(64000);
+		expect(toPiModel({ id: "m-fallback-from-invalid", max_tokens: 0, max_output_tokens: 64000 })?.maxTokens).toBe(
+			64000,
+		);
+		expect(toPiModel({ id: "m-invalid", max_tokens: 0 })?.maxTokens).toBe(DEFAULT_MAX_TOKENS);
+		expect(toPiModel({ id: "m-negative", max_tokens: -100 })?.maxTokens).toBe(DEFAULT_MAX_TOKENS);
+		expect(toPiModel({ id: "m-nan", max_tokens: Number.NaN })?.maxTokens).toBe(DEFAULT_MAX_TOKENS);
+		expect(toPiModel({ id: "m-infinity", max_tokens: Number.POSITIVE_INFINITY })?.maxTokens).toBe(DEFAULT_MAX_TOKENS);
+		expect(toPiModel({ id: "m-default" })?.maxTokens).toBe(DEFAULT_MAX_TOKENS);
+		expect(
+			toPiModel({
+				slug: "claude-sonnet-5",
+				display_name: "Claude Sonnet 5",
+				context_window: 1000000,
+				max_tokens: 128000,
+			})?.maxTokens,
+		).toBe(128000);
 	});
 });
 
@@ -525,5 +554,37 @@ describe("config and auth file helpers", () => {
 			providerName: DEFAULT_PROVIDER_NAME,
 		});
 		expect(DEFAULT_BASE_URL).toBe("http://127.0.0.1:8317");
+	});
+
+	it("loads configured default settings from settings.json", () => {
+		const agentDir = tempAgentDir();
+		expect(loadConfiguredDefaultSettings(agentDir)).toEqual({});
+
+		writeFileSync(
+			join(agentDir, "settings.json"),
+			JSON.stringify({ defaultProvider: "google", defaultModel: "gemini-3.8-flash-high" }),
+			"utf8",
+		);
+		expect(loadConfiguredDefaultSettings(agentDir)).toEqual({
+			defaultProvider: "google",
+			defaultModel: "gemini-3.8-flash-high",
+		});
+	});
+
+	it("checks if a model is referenced as default", () => {
+		expect(isModelReferencedAsDefault(undefined, "model-a", "cliproxyapi")).toBe(false);
+		expect(
+			isModelReferencedAsDefault(
+				{ defaultModel: "model-a", defaultProvider: "cliproxyapi" },
+				"model-a",
+				"cliproxyapi",
+			),
+		).toBe(true);
+		expect(
+			isModelReferencedAsDefault({ defaultModel: "model-a", defaultProvider: "google" }, "model-a", "cliproxyapi"),
+		).toBe(false);
+		expect(isModelReferencedAsDefault({ defaultModel: "cliproxyapi/model-a" }, "model-a", "cliproxyapi")).toBe(true);
+		expect(isModelReferencedAsDefault({ defaultModel: "cliproxyapi:model-a" }, "model-a", "cliproxyapi")).toBe(true);
+		expect(isModelReferencedAsDefault({ defaultModel: "other/model-a" }, "model-a", "cliproxyapi")).toBe(false);
 	});
 });

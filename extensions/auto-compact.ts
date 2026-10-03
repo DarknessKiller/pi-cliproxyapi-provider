@@ -1,6 +1,6 @@
 import { type Api, type AssistantMessage, createAssistantMessageEventStream, type Model } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, SettingsManager } from "@earendil-works/pi-coding-agent";
-import type { CliproxyCodexStreamSimple } from "./codex-stream.ts";
+import type { CliproxyCodexStreamSimple, CloseCodexWebSocketSessions } from "./codex-stream.ts";
 import { resolveContextCapReserveTokens } from "./lib.ts";
 
 export const PROACTIVE_COMPACTION_ERROR_PREFIX = "context_length_exceeded: proactive compaction threshold reached";
@@ -8,6 +8,91 @@ export const PROACTIVE_COMPACTION_ERROR_PREFIX = "context_length_exceeded: proac
 export interface ProactiveCompactionSettings {
 	enabled: boolean;
 	reserveTokens: number;
+}
+
+export type { CloseCodexWebSocketSessions };
+
+const DEFAULT_COMPACTION_ENABLED = true;
+const DEFAULT_COMPACTION_RESERVE_TOKENS = 16384;
+
+interface CompatibleSettingsManager {
+	reload?: () => Promise<void> | void;
+	reloadFromDisk?: () => Promise<void> | void;
+	getCompactionSettings?: () => { enabled?: unknown; reserveTokens?: unknown };
+	get?: (key: string) => unknown;
+}
+
+function isCompatibleSettingsManager(value: unknown): value is CompatibleSettingsManager {
+	return typeof value === "object" && value !== null;
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+	return (
+		((typeof value === "object" && value !== null) || typeof value === "function") &&
+		typeof (value as { then?: unknown }).then === "function"
+	);
+}
+
+function normalizeCompactionSettings(enabled: unknown, reserveTokens: unknown): ProactiveCompactionSettings {
+	return {
+		enabled: typeof enabled === "boolean" ? enabled : DEFAULT_COMPACTION_ENABLED,
+		reserveTokens:
+			typeof reserveTokens === "number" && Number.isFinite(reserveTokens) && reserveTokens >= 0
+				? reserveTokens
+				: DEFAULT_COMPACTION_RESERVE_TOKENS,
+	};
+}
+
+function readCompactionSettings(manager: CompatibleSettingsManager): ProactiveCompactionSettings | undefined {
+	if (typeof manager.getCompactionSettings === "function") {
+		try {
+			const settings = manager.getCompactionSettings();
+			return normalizeCompactionSettings(settings?.enabled, settings?.reserveTokens);
+		} catch {
+			// Fall through to OMP's key-based settings API when available.
+		}
+	}
+	if (typeof manager.get === "function") {
+		try {
+			return normalizeCompactionSettings(manager.get("compaction.enabled"), manager.get("compaction.reserveTokens"));
+		} catch {
+			return undefined;
+		}
+	}
+	return undefined;
+}
+
+async function reloadSettings(manager: CompatibleSettingsManager): Promise<void> {
+	if (typeof manager.reload === "function") {
+		try {
+			await manager.reload();
+		} catch {
+			// Keep the last successfully read settings when disk reload fails.
+		}
+		return;
+	}
+	if (typeof manager.reloadFromDisk === "function") {
+		try {
+			await manager.reloadFromDisk();
+		} catch {
+			// Keep the last successfully read settings when disk reload fails.
+		}
+	}
+}
+
+/** Session id used to key pi-ai's reused Codex WebSocket. */
+export function resolveCompactionSessionId(source?: {
+	sessionId?: unknown;
+	sessionManager?: { getSessionId?: () => unknown };
+}): string | undefined {
+	const fromManager = source?.sessionManager?.getSessionId?.();
+	if (typeof fromManager === "string" && fromManager.trim()) {
+		return fromManager;
+	}
+	if (typeof source?.sessionId === "string" && source.sessionId.trim()) {
+		return source.sessionId;
+	}
+	return undefined;
 }
 
 /** Keep enough headroom for the model's output budget and optional reserve override. */
@@ -80,29 +165,59 @@ export function createProactiveCompactionStream(model: Model<Api>, contextTokens
 }
 
 export class ProactiveCompactionController {
-	private settingsManager: SettingsManager | undefined;
+	private settingsManager: CompatibleSettingsManager | undefined;
+	private cachedCompactionSettings: ProactiveCompactionSettings | undefined;
 	private pending: { modelKey: string; contextTokens: number; threshold: number } | undefined;
+	private closeWebSocketSessions: CloseCodexWebSocketSessions | undefined;
 
 	constructor(
 		private readonly agentDir: string,
 		private readonly providerId: string,
-	) {}
+		closeWebSocketSessions?: CloseCodexWebSocketSessions,
+	) {
+		this.closeWebSocketSessions = closeWebSocketSessions;
+	}
+
+	setCloseWebSocketSessions(closeWebSocketSessions: CloseCodexWebSocketSessions): void {
+		this.closeWebSocketSessions = closeWebSocketSessions;
+	}
 
 	register(pi: ExtensionAPI): void {
-		pi.on("session_start", (_event, ctx) => {
-			this.settingsManager = SettingsManager.create(ctx.cwd, this.agentDir, {
-				projectTrusted: ctx.isProjectTrusted(),
-			});
+		pi.on("session_start", async (_event, ctx) => {
+			this.cachedCompactionSettings = undefined;
+			try {
+				const created: unknown = SettingsManager.create(ctx.cwd, this.agentDir, {
+					projectTrusted: ctx.isProjectTrusted(),
+				});
+				const manager = isPromiseLike(created) ? await created : created;
+				this.settingsManager = isCompatibleSettingsManager(manager) ? manager : undefined;
+				this.cachedCompactionSettings = this.settingsManager
+					? readCompactionSettings(this.settingsManager)
+					: undefined;
+			} catch {
+				this.settingsManager = undefined;
+			}
 			this.pending = undefined;
 		});
 
 		pi.on("session_shutdown", () => {
 			this.settingsManager = undefined;
+			this.cachedCompactionSettings = undefined;
 			this.pending = undefined;
 		});
 
-		pi.on("session_compact", () => {
+		pi.on("session_before_compact", () => {
+			// Compaction summaries use the same provider stream. Clear the synthetic
+			// overflow before pi invokes the summarizer so it cannot abort compaction.
 			this.pending = undefined;
+		});
+
+		pi.on("session_compact", (_event, ctx) => {
+			this.pending = undefined;
+			// CLIProxyAPI binds server-side Codex context to the WebSocket. Compaction
+			// only rewrites the client message list, so reuse would keep cacheRead high
+			// and retrigger proactive compaction on a now-small session.
+			this.resetWebSocketSession(resolveCompactionSessionId(ctx));
 		});
 
 		pi.on("agent_settled", () => {
@@ -122,9 +237,15 @@ export class ProactiveCompactionController {
 			if (!settingsManager) {
 				return;
 			}
-			await settingsManager.reload();
+			await reloadSettings(settingsManager);
+			const refreshedSettings = readCompactionSettings(settingsManager);
+			if (refreshedSettings) {
+				this.cachedCompactionSettings = refreshedSettings;
+			}
 			const settings = this.getCompactionSettings(ctx.model.maxTokens);
-			if (!settings) return;
+			if (!settings) {
+				return;
+			}
 			const contextTokens = ctx.getContextUsage()?.tokens;
 			if (contextTokens === null || contextTokens === undefined) {
 				return;
@@ -142,7 +263,11 @@ export class ProactiveCompactionController {
 	}
 
 	getCompactionSettings(maxTokens?: number): ProactiveCompactionSettings | undefined {
-		const settings = this.settingsManager?.getCompactionSettings();
+		const current = this.settingsManager ? readCompactionSettings(this.settingsManager) : undefined;
+		if (current) {
+			this.cachedCompactionSettings = current;
+		}
+		const settings = current ?? this.cachedCompactionSettings;
 		if (!settings) return undefined;
 		return {
 			...settings,
@@ -162,8 +287,21 @@ export class ProactiveCompactionController {
 			}
 
 			this.pending = undefined;
+			this.resetWebSocketSession(options?.sessionId);
 			return createProactiveCompactionStream(model, pending.contextTokens, pending.threshold);
 		};
+	}
+
+	private resetWebSocketSession(sessionId?: string): void {
+		if (!sessionId || !this.closeWebSocketSessions) {
+			return;
+		}
+		try {
+			this.closeWebSocketSessions(sessionId);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			console.warn(`[pi-cliproxyapi-provider] failed to close Codex WebSocket for session ${sessionId}: ${message}`);
+		}
 	}
 
 	private modelKey(model: Pick<Model<Api>, "provider" | "id">): string {
