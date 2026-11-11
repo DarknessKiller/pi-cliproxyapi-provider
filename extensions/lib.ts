@@ -12,6 +12,11 @@ export type ThinkingLevelMap = Partial<
 	Record<"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra", string | null>
 >;
 
+// Local subset of pi OpenAIResponsesCompat; only the flags this plugin emits.
+export interface PiProviderModelCompat {
+	supportsMidConvoEffort?: boolean;
+}
+
 export const DEFAULT_PROVIDER_ID = "cliproxyapi";
 export const DEFAULT_PROVIDER_NAME = "CLIProxyAPI";
 export const DEFAULT_BASE_URL = "http://127.0.0.1:8317";
@@ -156,6 +161,7 @@ export interface CodexClientModel {
 	max_completion_tokens?: number;
 	input_modalities?: string[];
 	supported_reasoning_levels?: CodexReasoningLevel[] | string[];
+	supports_reasoning_effort_updates?: boolean;
 	default_service_tier?: string | null;
 	service_tiers?: Array<CodexServiceTier | string>;
 	additional_speed_tiers?: string[];
@@ -193,6 +199,7 @@ export interface PiProviderModel {
 	contextWindow: number;
 	maxTokens: number;
 	thinkingLevelMap?: ThinkingLevelMap;
+	compat?: PiProviderModelCompat;
 	stale?: boolean;
 	lastSeenAt?: number;
 	staleSince?: number;
@@ -593,6 +600,10 @@ export function supportsFastServiceTier(model: CodexClientModel): boolean {
 	return Array.isArray(model.service_tiers) && model.service_tiers.length > 0;
 }
 
+export function supportsReasoningEffortUpdates(model: CodexClientModel): boolean {
+	return model.supports_reasoning_effort_updates === true;
+}
+
 export function toPiModel(
 	model: CodexClientModel,
 	costCatalog?: ModelsDevCostCatalog,
@@ -645,6 +656,7 @@ export function toPiModel(
 		contextWindow: capped.contextWindow,
 		maxTokens: capped.maxTokens,
 		thinkingLevelMap: buildThinkingLevelMap(efforts),
+		...(hasReasoning && supportsReasoningEffortUpdates(model) ? { compat: { supportsMidConvoEffort: true } } : {}),
 	};
 }
 

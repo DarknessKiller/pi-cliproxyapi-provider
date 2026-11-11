@@ -207,9 +207,14 @@ From CPA catalog entry → pi model:
 | `max_completion_tokens` | `maxTokens` |
 | `input_modalities` | `input` (`text` / `image`) |
 | `supported_reasoning_levels[].effort` | `thinkingLevelMap` + `reasoning` |
+| `supports_reasoning_effort_updates` | `compat.supportsMidConvoEffort` |
 | `visibility: "hide"` | skipped |
 
 Unsupported pi thinking levels are set to `null` so they are hidden in the UI. When available, prices are matched against canonical model entries in `models.dev`; `cost.tiers[].tier.size` becomes pi's `inputTokensAbove`, including thresholds such as `272000`. The legacy `context_over_200k` field is used only when no explicit tiers are present. Ambiguous reseller prices are not selected arbitrarily and fall back to zero. These are catalog/list prices, not a guarantee of CPA's own markup or billing.
+
+## Cache-preserving thinking level changes
+
+Models whose catalog entry sets `supports_reasoning_effort_updates` (GPT-6 on CLIProxyAPI) get pi's cache-preserving mid-session thinking level changes, matching the behavior pi >=1.3.0 ships for the OpenAI provider, with placement following the OpenAI documentation: the effort of the first turn becomes the fixed request-level `reasoning.effort`, and each later change is carried by a `configuration_update` input item placed immediately before the user message it applies to, so switching levels mid-session keeps the prompt prefix — and the upstream prompt cache — intact instead of rewriting it. WebSocket `previous_response_id` continuation also survives level changes. Histories lacking initial recorded levels (for example, sessions started before this support landed) may still need one full-context request while the baseline is being established. The behavior requires a pi >=1.3.0 host (its shared Responses converter); on older hosts the plugin detects the missing support and falls back to the classic request-level effort.
 
 The raw `models.dev` response is cached for 24 hours at `~/.pi/agent/tmp/models-dev-cache.json`. A fresh cache avoids the network request; an expired cache is refreshed with a three-second timeout, and stale data is retained if refresh fails. If neither the network nor a previous cache is available, pricing safely falls back to zero. A small explicit alias table covers known CLIProxyAPI variants such as `gemini-pro-agent` → `gemini-3.1-pro-preview`; unknown variants are not guessed.
 

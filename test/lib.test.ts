@@ -33,6 +33,7 @@ import {
 	resolveIdentity,
 	saveConfigFile,
 	supportsFastServiceTier,
+	supportsReasoningEffortUpdates,
 	toPiModel,
 	ZERO_COST,
 } from "../extensions/lib.ts";
@@ -202,6 +203,38 @@ describe("model mapping helpers", () => {
 			maxTokens: 128000,
 			thinkingLevelMap: buildThinkingLevelMap(["high", "none"]),
 		});
+	});
+
+	it("maps supports_reasoning_effort_updates to compat.supportsMidConvoEffort", () => {
+		expect(supportsReasoningEffortUpdates({ supports_reasoning_effort_updates: true })).toBe(true);
+		expect(supportsReasoningEffortUpdates({ supports_reasoning_effort_updates: false })).toBe(false);
+		expect(supportsReasoningEffortUpdates({})).toBe(false);
+
+		const capable = toPiModel({
+			slug: "gpt-6-sol",
+			supported_reasoning_levels: [{ effort: "high" }],
+			supports_reasoning_effort_updates: true,
+		});
+		expect(capable?.compat).toEqual({ supportsMidConvoEffort: true });
+
+		const flagged = toPiModel({
+			slug: "gpt-5.6-sol",
+			supported_reasoning_levels: [{ effort: "high" }],
+			supports_reasoning_effort_updates: false,
+		});
+		expect(flagged?.compat).toBeUndefined();
+
+		const unflagged = toPiModel({
+			slug: "gpt-5.5",
+			supported_reasoning_levels: [{ effort: "high" }],
+		});
+		expect(unflagged?.compat).toBeUndefined();
+
+		const nonReasoning = toPiModel({
+			slug: "plain-model",
+			supports_reasoning_effort_updates: true,
+		});
+		expect(nonReasoning?.compat).toBeUndefined();
 	});
 
 	it("skips hide visibility and missing ids", () => {

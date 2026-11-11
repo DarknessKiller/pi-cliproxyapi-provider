@@ -634,12 +634,14 @@ describe("provider startup cache behavior", () => {
 			saveModelsCache(agentDir, cached, 1);
 
 			const fetchMock = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network down"));
+			const warnMock = vi.spyOn(console, "warn").mockImplementation(() => {});
 			const { pi } = createPiMock();
 
 			try {
 				await expect(providerExtension(pi)).resolves.toBeUndefined();
 				await waitForAsyncRefresh();
 				expect(fetchMock).toHaveBeenCalledTimes(2);
+				expect(warnMock).not.toHaveBeenCalledWith(expect.stringContaining("failed to refresh cached models"));
 
 				const callsWithModels = (
 					(pi.registerProvider as ReturnType<typeof vi.fn>).mock.calls as Array<
@@ -651,6 +653,7 @@ describe("provider startup cache behavior", () => {
 				expect(diskCache?.models[0].id).toBe("startup-fallback");
 			} finally {
 				fetchMock.mockRestore();
+				warnMock.mockRestore();
 			}
 		});
 	});
